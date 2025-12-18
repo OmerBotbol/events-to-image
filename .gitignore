@@ -1,0 +1,13 @@
+# 1. Ignore all files in the 'csv' folder
+csv/*
+# But do not ignore the .gitkeep file (so the folder is tracked)
+!csv/.gitkeep
+
+# 2. Ignore all files in ANY 'chunks' folder (inside any experiment)
+events/*
+# But do not ignore the .gitkeep file
+!events/.gitkeep
+
+venv/
+
+utils/cnvt_raw_2_csv/
