@@ -10,90 +10,73 @@ def convertToHDF5(csv_file,path):
    h5_file = path / 'events.h5' # Save as a new "clean" file
    chunk_size = 500_000        
 
-   # 1. Define your Column Names (Since you have no headers)
+   # Actual column mapping
    column_names = ['x', 'y', 'polarity', 'timestamp']
 
-   # 2. Define the "Trash" Pixel Coordinates
-   # Replace these with your actual noisy pixel location
-   BAD_X = 508   
-   BAD_Y = 498
-
-   # 3. Define Types
-   schema_overrides = { 
+   # Target types (Now we can actually enforce these separately!)
+   types = {
       'x': pl.UInt16,
       'y': pl.UInt16,
       'polarity': pl.UInt8,
       'timestamp': pl.UInt64
-   }
+}
 
-   # --- THE CONVERSION ---
-   # print(f"Starting conversion with filtering: {csv_file} -> {h5_file}...")
-   print(f"Removing all events at pixel ({BAD_X}, {BAD_Y})")
+   BAD_X, BAD_Y = 508, 498
+
+   # print(f"Starting Columnar Conversion: {csv_file} -> {h5_file}...")
 
    if os.path.exists(h5_file):
       os.remove(h5_file)
 
    with h5py.File(h5_file, 'w') as f:
-      dset = None
+      # 1. Create the Group
+      grp = f.create_group('events')
+      
+      # Dictionary to hold our 4 datasets
+      dsets = {} 
+      
       row_count = 0
-      dropped_count = 0
       
       reader = pl.read_csv_batched(
-         csv_file, 
-         batch_size=chunk_size, 
-         has_header=False, 
-         new_columns=column_names 
+         csv_file, batch_size=chunk_size, has_header=False, new_columns=column_names
       )
       
       while True:
          batches = reader.next_batches(1)
-         if not batches:
-               break
-         
+         if not batches: break
          chunk = batches[0]
-         initial_len = len(chunk)
          
-         # --- CAST TYPES ---
-         chunk = chunk.select([
-               pl.col(name).cast(dtype) for name, dtype in schema_overrides.items()
-         ])
-         
-         # --- THE FILTERING STEP ---
-         # "Keep rows where X is NOT Bad OR Y is NOT Bad"
-         # (This removes only rows where BOTH X and Y match the bad pixel)
-         chunk = chunk.filter(
-               ~((pl.col("x") == BAD_X) & (pl.col("y") == BAD_Y))
-         )
-         
-         # Calculate how many we dropped (for your info)
-         dropped_count += (initial_len - len(chunk))
-         
-         # If the chunk is empty after filtering (rare), skip it
-         if len(chunk) == 0:
-               continue
+         # Filter Hot Pixel
+         chunk = chunk.filter(~((pl.col("x") == BAD_X) & (pl.col("y") == BAD_Y)))
+         if len(chunk) == 0: continue
+
+         # --- WRITE EACH COLUMN SEPARATELY ---
+         for col_name in column_names:
+               # Extract column and convert to numpy with CORRECT type
+               target_type = types[col_name]
+            
+               # 2. Cast and Convert to Numpy
+               data = chunk[col_name].cast(target_type).to_numpy()
                
-         data_numpy = chunk.to_numpy()
+               # Create Dataset on first run
+               if col_name not in dsets:
+                  dsets[col_name] = grp.create_dataset(
+                     col_name,
+                     data=data,
+                     maxshape=(None,), # 1D array that can grow
+                     chunks=True,
+                     compression="gzip"
+                  )
+               # Resize and Append on subsequent runs
+               else:
+                  ds = dsets[col_name]
+                  ds.resize((ds.shape[0] + data.shape[0]), axis=0)
+                  ds[-data.shape[0]:] = data
          
-         # --- WRITE TO HDF5 ---
-         if dset is None:
-               dset = f.create_dataset(
-                  'events', 
-                  data=data_numpy, 
-                  maxshape=(None, len(column_names)), 
-                  chunks=True, 
-                  compression="gzip"
-               )
-         else:
-               dset.resize((dset.shape[0] + data_numpy.shape[0]), axis=0)
-               dset[-data_numpy.shape[0]:] = data_numpy
-               
          row_count += len(chunk)
-
-         if dset is not None:
-            dset.attrs['columns'] = column_names
-            dset.attrs['hot_pixel_removed'] = [BAD_X, BAD_Y]
-
-   print(f"Done! Total valid events: {row_count}. Total trash removed: {dropped_count}")
+         print(f"Processed {row_count} rows...")
+         
+      print("Conversion Complete.")
     
     
 def runDecoder(path):
