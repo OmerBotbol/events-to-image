@@ -12,5 +12,5 @@ decoder.convertToHDF5(script_dir / "csv" / "out0.csv",events_path)
 
 hdf5_path = events_path / "events.h5"
 
-events = h5py.File(hdf5_path, "r")
-print(events.keys())
+file = h5py.File(hdf5_path, "r")
+events = file["events"]

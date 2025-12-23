@@ -17,8 +17,8 @@ def convertToHDF5(csv_file,path):
    types = {
       'x': pl.UInt16,
       'y': pl.UInt16,
-      'polarity': pl.UInt8,
-      'timestamp': pl.UInt64
+      'polarity': pl.Int8,
+      'timestamp': pl.Float64
 }
 
    BAD_X, BAD_Y = 508, 498
@@ -49,6 +49,11 @@ def convertToHDF5(csv_file,path):
          # Filter Hot Pixel
          chunk = chunk.filter(~((pl.col("x") == BAD_X) & (pl.col("y") == BAD_Y)))
          if len(chunk) == 0: continue
+
+         chunk = chunk.with_columns([
+                (pl.col("timestamp") / 1_000_000.0).alias("timestamp"),
+                (pl.col("polarity").cast(pl.Int8) * 2 - 1).alias("polarity")
+         ])
 
          # --- WRITE EACH COLUMN SEPARATELY ---
          for col_name in column_names:
