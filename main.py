@@ -70,11 +70,14 @@ image = image / 65
 moving_avg = uniform_filter1d(image, size=1500, axis=1, mode="nearest")
 imageHP = image - moving_avg
 
-# --- Display every 100th column, inverted ---
-# MATLAB: figure; imshow(-imageHP(:,1:100:end)*1)
-plt.figure()
-# plt.imshow(-image[:, ::100], cmap="gray", aspect="auto")
-plt.imshow(-imageHP[:, ::100], cmap="gray", aspect="auto")
-plt.title("High-pass filtered event image")
-plt.colorbar()
+# --- Display and save ---
+fig, ax = plt.subplots()
+ax.imshow(-imageHP[:, ::100], cmap="gray", aspect="auto")
+ax.set_title("High-pass filtered event image")
+fig.colorbar(ax.images[0], ax=ax)
+
+output_path = events_path / "reconstructed_image.png"
+fig.savefig(output_path, dpi=150, bbox_inches="tight")
+print(f"Image saved to {output_path}")
+
 plt.show()
