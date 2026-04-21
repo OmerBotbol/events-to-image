@@ -47,8 +47,8 @@ def convertToHDF5(csv_file,path):
          chunk = batches[0]
          
          # Filter Hot Pixel
-         chunk = chunk.filter(~((pl.col("x") == BAD_X) & (pl.col("y") == BAD_Y)))
-         if len(chunk) == 0: continue
+         # chunk = chunk.filter(~((pl.col("x") == BAD_X) & (pl.col("y") == BAD_Y)))
+         # if len(chunk) == 0: continue
 
          chunk = chunk.with_columns([
                 (pl.col("timestamp") / 1_000_000.0).alias("timestamp"),
