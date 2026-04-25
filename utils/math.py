@@ -1,46 +1,28 @@
-import math
+import numpy as np
 
 
 def calculate_object_velocity(
-    screen_width_m: float,
-    camera_distance_m: float,
     duration_s: float,
     camera_resolution_px: tuple[int, int],
     roi_x_start_px: int = None,
     roi_x_end_px: int = None,
-) -> dict:
+) -> float:
     """
-    Calculate the velocity of an object moving across a screen filmed by a camera.
+    Calculate the linear velocity of an object moving across a screen in pixels/s.
 
     Args:
-        screen_width_m:        Physical width of the screen in meters.
-        camera_distance_m:     Distance from the camera lens to the screen surface in meters.
-        duration_s:            Time the object takes to travel from start to end position (seconds).
+        duration_s:            Time the object takes to travel from start to end (seconds).
         camera_resolution_px:  Camera resolution as (width_px, height_px).
-        roi_x_start_px:        Pixel x-coordinate in the camera frame where the movement starts.
-                               Defaults to 0 (left edge of frame).
-        roi_x_end_px:          Pixel x-coordinate in the camera frame where the movement ends.
-                               Defaults to camera frame width (right edge).
+        roi_x_start_px:        Pixel x where movement starts. Defaults to 0.
+        roi_x_end_px:          Pixel x where movement ends. Defaults to frame width.
 
     Returns:
-        dict with:
-            linear_velocity_m_s:    Physical velocity on the screen surface (m/s).
-            angular_velocity_rad_s: Angular velocity as seen from the camera lens (rad/s).
-            angular_velocity_deg_s: Same, in degrees/s.
-            displacement_m:         Physical distance travelled on screen (m).
-            total_angle_rad:        Total angle swept at the camera lens (rad).
+        Velocity in pixels/s.
     """
     if duration_s <= 0:
         raise ValueError("duration_s must be positive")
-    if camera_distance_m <= 0:
-        raise ValueError("camera_distance_m must be positive")
-    if screen_width_m <= 0:
-        raise ValueError("screen_width_m must be positive")
 
     cam_width_px, _ = camera_resolution_px
-    if cam_width_px <= 0:
-        raise ValueError("camera resolution width must be positive")
-
     if roi_x_start_px is None:
         roi_x_start_px = 0
     if roi_x_end_px is None:
@@ -49,29 +31,47 @@ def calculate_object_velocity(
     if not (0 <= roi_x_start_px <= cam_width_px and 0 <= roi_x_end_px <= cam_width_px):
         raise ValueError("ROI pixel coordinates must be within camera resolution")
 
-    start_x_fraction = roi_x_start_px / cam_width_px
-    end_x_fraction   = roi_x_end_px   / cam_width_px
+    return abs(roi_x_end_px - roi_x_start_px) / duration_s
 
-    displacement_m = abs(end_x_fraction - start_x_fraction) * screen_width_m
-    linear_velocity_m_s = displacement_m / duration_s
 
-    # Angular positions relative to the camera's optical axis (centred on the screen)
-    screen_centre_x = screen_width_m / 2.0
-    x_start = (start_x_fraction * screen_width_m) - screen_centre_x
-    x_end   = (end_x_fraction   * screen_width_m) - screen_centre_x
+def compute_cpp(image: np.ndarray, subpixel_scale: float = 100.0) -> dict:
+    """
+    Compute the dominant spatial frequency (cycles per pixel) of the reconstructed image.
 
-    angle_start_rad = math.atan2(x_start, camera_distance_m)
-    angle_end_rad   = math.atan2(x_end,   camera_distance_m)
+    Uses the 1D power spectrum along the x axis (axis=1), averaged across all rows,
+    then picks the frequency bin with the highest power (DC excluded).
 
-    total_angle_rad        = abs(angle_end_rad - angle_start_rad)
-    angular_velocity_rad_s = total_angle_rad / duration_s
-    angular_velocity_deg_s = math.degrees(angular_velocity_rad_s)
+    Args:
+        image:           2D reconstructed image array, shape (rows, cols).
+        subpixel_scale:  The scale factor applied when building pix during reconstruction
+                         (default 100, matching `round(x * 1e2)`). The image is averaged
+                         in groups of this size before the FFT, reducing it to camera-pixel
+                         resolution and avoiding large memory allocations.
+
+    Returns:
+        dict with:
+            cpp_camera_px:   Dominant frequency in cycles per camera pixel.
+            frequency_axis:  Frequency array in cycles per camera pixel (0 to 0.5).
+            power_spectrum:  Mean power spectrum across rows at camera-pixel resolution.
+    """
+    scale = int(subpixel_scale)
+
+    # Downsample from subpixel to camera-pixel resolution by averaging groups of `scale` cols.
+    # Trim to a multiple of scale first, then reshape and mean.
+    n_trim = (image.shape[1] // scale) * scale
+    image_ds = image[:, :n_trim].reshape(image.shape[0], -1, scale).mean(axis=2)
+
+    N = image_ds.shape[1]
+    fft_mag = np.abs(np.fft.rfft(image_ds, axis=1))
+    power = np.mean(fft_mag ** 2, axis=0)
+    freq_axis = np.fft.rfftfreq(N)  # cycles per camera pixel
+
+    # Exclude DC (index 0) when searching for the dominant peak
+    peak_idx = int(np.argmax(power[1:]) + 1)
+    cpp_camera_px = float(freq_axis[peak_idx])
 
     return {
-        "linear_velocity_m_s":    linear_velocity_m_s,
-        "angular_velocity_rad_s": angular_velocity_rad_s,
-        "angular_velocity_deg_s": angular_velocity_deg_s,
-        "displacement_m":         displacement_m,
-        "total_angle_rad":        total_angle_rad,
+        "cpp_camera_px":  cpp_camera_px,
+        "frequency_axis": freq_axis,
+        "power_spectrum": power,
     }
-
