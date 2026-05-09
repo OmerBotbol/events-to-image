@@ -56,15 +56,21 @@ def compute_cpp(image: np.ndarray, subpixel_scale: float = 100.0) -> dict:
     """
     scale = int(subpixel_scale)
 
-    # Downsample from subpixel to camera-pixel resolution by averaging groups of `scale` cols.
-    # Trim to a multiple of scale first, then reshape and mean.
-    n_trim = (image.shape[1] // scale) * scale
-    image_ds = image[:, :n_trim].reshape(image.shape[0], -1, scale).mean(axis=2)
+    # Keep 10 subpixels per camera pixel so the FFT can see up to 5.0 CPP.
+    # Downsampling all the way to 1 px/camera-px would hard-cap the result at 0.5 CPP,
+    # making super-resolution detection impossible.
+    ds = max(1, scale // 10)          # subpixels to average per output sample
+    effective_scale = scale / ds      # output samples per camera pixel  (= 10 when scale=100)
+
+    n_trim = (image.shape[1] // ds) * ds
+    image_ds = image[:, :n_trim].reshape(image.shape[0], -1, ds).mean(axis=2)
 
     N = image_ds.shape[1]
     fft_mag = np.abs(np.fft.rfft(image_ds, axis=1))
     power = np.mean(fft_mag ** 2, axis=0)
-    freq_axis = np.fft.rfftfreq(N)  # cycles per camera pixel
+
+    # freq in cycles/output-sample → convert to cycles/camera-pixel (CPP)
+    freq_axis = np.fft.rfftfreq(N) * effective_scale
 
     # Exclude DC (index 0) when searching for the dominant peak
     peak_idx = int(np.argmax(power[1:]) + 1)
