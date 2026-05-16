@@ -411,6 +411,9 @@ class TWEApp(tk.Tk):
                 norm_div=norm_div,
             )
 
+            # Save raw float32 array for downstream quality analysis (results.py).
+            np.save(events_path / "reconstructed_raw.npy", imageHP)
+
             # ── 5. CPP metric ────────────────────────────────────────────────
             cpp_result = compute_cpp(imageHP, subpixel_scale=float(subpixel_scale))
             cpp_val    = cpp_result["cpp_camera_px"]
