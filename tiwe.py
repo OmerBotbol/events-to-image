@@ -20,8 +20,6 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import decoder
-from utils.math import compute_cpp
-from utils.flow import estimate_vx
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -110,7 +108,7 @@ class TWEApp(tk.Tk):
         tk.Button(self, text="Browse…", command=self._browse).grid(
             row=0, column=2, **P)
 
-        # ── decode options ──
+        # ── decode options + Decode button ──
         decode_frame = tk.Frame(self)
         decode_frame.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=2)
 
@@ -132,6 +130,11 @@ class TWEApp(tk.Tk):
             variable=self.gpu_decode_var,
         ).pack(side="left")
 
+        tk.Button(
+            decode_frame, text="Decode  →  .h5", command=self._decode,
+            bg="#FF9800", fg="white", font=("Arial", 9, "bold"),
+        ).pack(side="left", padx=16)
+
         ttk.Separator(self, orient="horizontal").grid(
             row=2, column=0, columnspan=3, sticky="ew", pady=6)
 
@@ -141,11 +144,9 @@ class TWEApp(tk.Tk):
         self.vx_var = tk.StringVar(value="")
         tk.Entry(self, textvariable=self.vx_var, width=15).grid(
             row=3, column=1, sticky="w", **P)
-        tk.Button(self, text="Auto-estimate", command=self._auto_vx).grid(
-            row=3, column=2, **P)
         tk.Label(
             self,
-            text="Leave blank to auto-estimate via optical flow",
+            text="Enter manually or use 'Scan vx' below  (required)",
             foreground="gray",
         ).grid(row=4, column=1, sticky="w", padx=8)
 
@@ -227,28 +228,34 @@ class TWEApp(tk.Tk):
     def _hdf5_path(self) -> Path:
         return Path(self.folder_var.get().strip()) / "events.h5"
 
-    def _auto_vx(self):
+    def _decode(self):
         folder = self.folder_var.get().strip()
         if not folder:
             messagebox.showerror("Error", "Select a folder first.")
             return
-        h5 = Path(folder) / "events.h5"
-        if not h5.exists():
-            messagebox.showerror("Error", "events.h5 not found. Run decoding first.")
-            return
-        self._status("Loading events for velocity estimation…")
+        events_path = Path(folder)
         self.progress.start()
         try:
-            t, x, y, _ = load_events(h5)
-            duration  = float(t[-1] - t[0])
-            cam_width = int(x.max()) + 1
-            vx_init   = cam_width / max(duration, 1e-9)
-            vx = estimate_vx(t, x, y, vx_initial=vx_init)
-            self.vx_var.set(f"{vx:.4f}")
-            self._status(f"Auto-estimated  vx = {vx:.4f} px/s")
+            if self.fast_decode_var.get():
+                self._status("Fast-decoding .raw → events.h5  (no CSV)…")
+                decoder.runDecoderFast(events_path, use_gpu=self.gpu_decode_var.get())
+            else:
+                self._status("Decoding .raw → events.h5…")
+                decoder.runDecoder(events_path)
+
+            h5_path = events_path / "events.h5"
+            if h5_path.exists():
+                self._status(f"Decode complete  →  {h5_path}")
+            else:
+                messagebox.showerror(
+                    "Decode failed",
+                    "events.h5 was not created. Check that the folder contains .raw "
+                    "files and that the decoder executable is present.",
+                )
+                self._status("Decode failed.")
         except Exception as exc:
-            messagebox.showerror("Auto-estimate failed", str(exc))
-            self._status("Auto-estimate failed.")
+            messagebox.showerror("Decode failed", str(exc))
+            self._status(f"Decode error: {exc}")
         finally:
             self.progress.stop()
 
@@ -366,22 +373,12 @@ class TWEApp(tk.Tk):
 
         self.progress.start()
         try:
-            # ── 1. Decode .raw → events.h5 ──────────────────────────────────
+            # ── 1. Check events.h5 exists ────────────────────────────────────
             h5_path = events_path / "events.h5"
-            if h5_path.exists() and not self.force_decode_var.get():
-                self._status("Found existing events.h5 — skipping decode.")
-            elif self.fast_decode_var.get():
-                self._status("Fast-decoding .raw file(s) → events.h5  (no CSV)…")
-                decoder.runDecoderFast(events_path, use_gpu=self.gpu_decode_var.get())
-            else:
-                self._status("Decoding .raw file(s) → events.h5…")
-                decoder.runDecoder(events_path)
-
             if not h5_path.exists():
                 messagebox.showerror(
-                    "File not found",
-                    "events.h5 was not created. Check that the folder contains .raw files "
-                    "and that the decoder executable is present.",
+                    "events.h5 not found",
+                    "Use the 'Decode → .h5' button first to convert the .raw file.",
                 )
                 return
 
@@ -391,15 +388,13 @@ class TWEApp(tk.Tk):
 
             # ── 3. Resolve velocity ──────────────────────────────────────────
             vx_str = self.vx_var.get().strip()
-            if vx_str:
-                vx = float(vx_str)
-            else:
-                self._status("Estimating velocity via optical flow…")
-                duration  = float(t[-1] - t[0])
-                cam_width = int(x.max()) + 1
-                vx_init   = cam_width / max(duration, 1e-9)
-                vx = estimate_vx(t, x, y, vx_initial=vx_init)
-                self.vx_var.set(f"{vx:.4f}")
+            if not vx_str:
+                messagebox.showerror(
+                    "Velocity required",
+                    "Enter a vx value or use 'Scan vx' to find it first.",
+                )
+                return
+            vx = float(vx_str)
 
             # ── 4. TWE reconstruction ────────────────────────────────────────
             self._status(f"Applying TWE  (vx = {vx:.4f} px/s)…")
@@ -414,59 +409,17 @@ class TWEApp(tk.Tk):
             # Save raw float32 array for downstream quality analysis (results.py).
             np.save(events_path / "reconstructed_raw.npy", imageHP)
 
-            # ── 5. CPP metric ────────────────────────────────────────────────
-            cpp_result = compute_cpp(imageHP, subpixel_scale=float(subpixel_scale))
-            cpp_val    = cpp_result["cpp_camera_px"]
+            self._status(f"Done.   vx = {vx:.4f} px/s")
 
-            self._status(
-                f"Done.   CPP = {cpp_val:.4f} cycles/camera-px   |   "
-                f"vx = {vx:.4f} px/s"
-            )
-
-            # ── 6. Save + display ────────────────────────────────────────────
+            # ── 5. Save + display ────────────────────────────────────────────
             output_path = events_path / "reconstructed_image.png"
-            # downsample only for display so the plot stays responsive
-            ds = max(1, subpixel_scale // 10)
+            ds = max(1, subpixel_scale // 10)  # downsample for display only
 
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            fig.suptitle(
-                f"TWE Reconstruction  ·  vx = {vx:.4f} px/s  ·  "
-                f"CPP = {cpp_val:.4f}  (Nyquist = 0.5)",
-                fontsize=12,
-            )
-
-            axes[0].imshow(-imageHP[:, ::ds], cmap="gray", aspect="auto")
-            axes[0].set_title("Reconstructed image  (high-pass filtered)")
-            axes[0].set_xlabel(f"Subpixel column  (downsampled ×{ds} for display)")
-            axes[0].set_ylabel("Row")
-
-            # Native-pixel baseline: downsample TWE image to 1 px/camera-px,
-            # then compute its spectrum.  This shows what a regular camera frame
-            # would look like — any TWE power above this curve is super-resolution gain.
-            _n = (imageHP.shape[1] // subpixel_scale) * subpixel_scale
-            _img_native = (imageHP[:, :_n]
-                           .reshape(imageHP.shape[0], -1, subpixel_scale)
-                           .mean(axis=2))
-            _fft_nat  = np.abs(np.fft.rfft(_img_native, axis=1))
-            _pow_nat  = np.mean(_fft_nat ** 2, axis=0)
-            _freq_nat = np.fft.rfftfreq(_img_native.shape[1])  # 0 … 0.5 CPP
-
-            freq  = cpp_result["frequency_axis"]
-            power = cpp_result["power_spectrum"]
-            display_max = 3.0
-            mask = freq <= display_max
-            axes[1].plot(freq[mask], power[mask], linewidth=0.9,
-                         color="steelblue", label="TWE reconstruction")
-            axes[1].plot(_freq_nat, _pow_nat, linewidth=0.9, linestyle="--",
-                         color="darkorange", label="Native pixel baseline")
-            axes[1].axvline(cpp_val, color="r", linestyle="--",
-                            label=f"TWE peak  {cpp_val:.3f} CPP")
-            axes[1].axvline(0.5, color="k", linestyle=":",
-                            label="Nyquist  0.5 CPP")
-            axes[1].set_xlabel("Frequency  (cycles / camera-pixel)")
-            axes[1].set_ylabel("Mean power")
-            axes[1].set_title("Power spectrum  —  TWE vs native pixel  (up to 3 CPP)")
-            axes[1].legend(fontsize=8)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.imshow(-imageHP[:, ::ds], cmap="gray", aspect="auto")
+            ax.set_title(f"TWE Reconstruction  ·  vx = {vx:.4f} px/s", fontsize=12)
+            ax.set_xlabel(f"Subpixel column  (downsampled ×{ds} for display)")
+            ax.set_ylabel("Row")
 
             fig.tight_layout()
             fig.savefig(output_path, dpi=150, bbox_inches="tight")
