@@ -13,7 +13,6 @@ from pathlib import Path
 import h5py
 import numpy as np
 from scipy.ndimage import uniform_filter1d
-from scipy.sparse import coo_matrix
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -36,53 +35,102 @@ def load_events(hdf5_path: Path):
 
 
 def run_twe(t, x, y, polarity, vx: float, subpixel_scale: int,
-            hp_window: int, norm_div: float):
+            hp_window: int, norm_div: float,
+            save_path=None, status_cb=None):
     """
     Apply Temporal Event Warping and reconstruct a log-intensity image.
 
-    Steps follow the paper:
-      1. Warp timestamps to a common spatial reference  (eq. 17)
-      2. Map warped x to an integer subpixel grid
-      3. Accumulate polarity into a 2-D sparse histogram  (eq. 16)
-      4. Cumulative sum along the x-axis  →  log-intensity trace  (eq. 9)
-      5. Normalise
-      6. High-pass filter to remove DC drift / threshold imbalance  (sec. III-H)
+    Processes events row-by-row so peak RAM is always O(one row), regardless
+    of image size or subpixel scale.  The full float32 result is written
+    incrementally to save_path (a .npy file).
 
     Returns
     -------
-    imageHP : np.ndarray  shape (rows, subpixel_cols)
+    display_img : np.ndarray  shape (rows, subpixel_cols // ds)
+        Downsampled version for GUI display (ds = subpixel_scale // 10).
     """
-    # --- (1) TWE: x̂_k = x_k + v·(t_ref − t_k)  (eq. 17) ---
-    t_ref = float(t[-1])
-    dt    = (t - t_ref).astype(np.float32)   # t_k − t_ref  (negative for past events)
-    x    -= dt * np.float32(vx)              # x̂ = x + v·(t_ref − t_k)
-    del dt, t
+    import numpy.lib.format as npf
 
-    # --- (2) Map to integer subpixel grid ---
+    # --- (1) Time-window: one camera-width crossing ---
+    t_ref    = float(t[-1])
+    cam_span = float(x.max() - x.min())
+    if abs(vx) > 1e-6:
+        window_s = cam_span / abs(vx)
+        mask = t >= (t_ref - window_s)
+        if mask.sum() > 1000:
+            t = t[mask]; x = x[mask]; y = y[mask]; polarity = polarity[mask]
+        del mask
+
+    # --- (2) Warp x to reference time ---
+    dt = t.astype(np.float32) - np.float32(t_ref)
+    del t
+    x  = x.astype(np.float32) - dt * np.float32(vx)
+    del dt
+
+    # --- (3) Map to integer subpixel grid ---
     pix = np.round(x * np.float32(subpixel_scale)).astype(np.int32)
     del x
     pix -= pix.min()
 
-    # --- (3) Accumulate polarity into 2-D image ---
     num_rows = int(y.max()) + 1
     num_cols = int(pix.max()) + 1
-    image = coo_matrix(
-        (polarity, (y, pix)), shape=(num_rows, num_cols)
-    ).toarray()
-    del polarity, pix, y
 
-    # --- (4) Integrate along the warped-x axis  (cumulative polarity sum) ---
-    image = np.cumsum(image, axis=1)
+    if status_cb:
+        mb = num_rows * num_cols * 4 // 1_000_000
+        status_cb(f"Grid: {num_rows} rows × {num_cols} cols  ({mb} MB) — processing row-by-row…")
 
-    # --- (5) Normalise ---
-    image /= norm_div
+    # --- (4) Open .npy output file and write header ---
+    npy_file = None
+    if save_path is not None:
+        try:
+            npy_file = open(save_path, "wb")
+            npf.write_array_header_1_0(
+                npy_file,
+                {"descr": "<f4", "fortran_order": False, "shape": (num_rows, num_cols)},
+            )
+        except OSError:
+            npy_file = None
+            if status_cb:
+                status_cb("Could not open .npy file (disk full?) — display only…")
 
-    # --- (6) High-pass filter (subtract slow drift) ---
-    moving_avg = uniform_filter1d(image, size=hp_window, axis=1, mode="nearest")
-    imageHP    = image - moving_avg
-    del image, moving_avg
+    # --- (5) Process one row at a time using boolean masking ---
+    # Avoids argsort (which allocates a 200+ MB int64 index array).
+    ds           = max(1, subpixel_scale // 10)
+    display_rows = []
 
-    return imageHP
+    for r in range(num_rows):
+        if status_cb and r % 100 == 0:
+            status_cb(f"Processing row {r + 1}/{num_rows}…")
+
+        mask = (y == r)
+        if mask.any():
+            row = np.bincount(
+                pix[mask], weights=polarity[mask], minlength=num_cols
+            ).astype(np.float32)
+        else:
+            row = np.zeros(num_cols, dtype=np.float32)
+        del mask
+
+        np.cumsum(row, out=row)          # integrate
+        row /= norm_div                  # normalise
+        row -= uniform_filter1d(row, size=hp_window, mode="nearest")  # HP filter
+
+        if npy_file:
+            try:
+                npy_file.write(row.tobytes())
+            except OSError:
+                npy_file.close()
+                npy_file = None
+                if status_cb:
+                    status_cb("Disk full — skipping .npy save, display only…")
+
+        display_rows.append(row[::ds].copy())
+
+    if npy_file:
+        npy_file.close()
+
+    del pix, polarity, y
+    return np.vstack(display_rows)      # tiny: num_rows × (num_cols // ds)
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -208,12 +256,19 @@ class TWEApp(tk.Tk):
         self.progress = ttk.Progressbar(self, mode="indeterminate", length=460)
         self.progress.grid(row=12, column=0, columnspan=3, padx=8, pady=4)
 
+        # ── save checkbox ──
+        self.save_npy_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            self, text="Save full-resolution .npy to disk  (can be several GB — uncheck if disk is limited)",
+            variable=self.save_npy_var,
+        ).grid(row=13, column=0, columnspan=3, sticky="w", padx=8)
+
         # ── run button ──
         tk.Button(
             self, text="▶  Run TWE", command=self._run,
             bg="#4CAF50", fg="white", font=("Arial", 11, "bold"),
             padx=20, pady=8,
-        ).grid(row=13, column=0, columnspan=3, pady=14)
+        ).grid(row=14, column=0, columnspan=3, pady=14)
 
     # ── callbacks ────────────────────────────────────────────────────────────
 
@@ -357,26 +412,30 @@ class TWEApp(tk.Tk):
             vx = float(vx_str)
 
             # ── 4. TWE reconstruction ────────────────────────────────────────
+            # run_twe optionally writes the full .npy row-by-row and always
+            # returns a downsampled array for GUI display.
+            npy_path = events_path / "reconstructed_raw.npy"
+            save_path = str(npy_path) if self.save_npy_var.get() else None
             self._status(f"Applying TWE  (vx = {vx:.4f} px/s)…")
-            imageHP = run_twe(
+            display_img = run_twe(
                 t, x, y, polarity,
                 vx=vx,
                 subpixel_scale=subpixel_scale,
                 hp_window=hp_window,
                 norm_div=norm_div,
+                save_path=save_path,
+                status_cb=self._status,
             )
-
-            # Save raw float32 array for downstream quality analysis (results.py).
-            np.save(events_path / "reconstructed_raw.npy", imageHP)
-
+            if save_path:
+                print(f"Saved → {npy_path}")
             self._status(f"Done.   vx = {vx:.4f} px/s")
 
             # ── 5. Save + display ────────────────────────────────────────────
             output_path = events_path / "reconstructed_image.png"
-            ds = max(1, subpixel_scale // 10)  # downsample for display only
+            ds = max(1, subpixel_scale // 10)
 
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.imshow(-imageHP[:, ::ds], cmap="gray", aspect="auto")
+            ax.imshow(-display_img, cmap="gray", aspect="auto")
             ax.set_title(f"TWE Reconstruction  ·  vx = {vx:.4f} px/s", fontsize=12)
             ax.set_xlabel(f"Subpixel column  (downsampled ×{ds} for display)")
             ax.set_ylabel("Row")
