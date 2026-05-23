@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import decoder
+from utils.flow import scan_vx
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -282,59 +283,18 @@ class TWEApp(tk.Tk):
         self.progress.start()
         try:
             t, x, y, _ = load_events(h5)
+            n_events_total = len(t)
 
-            # Window: object travels ~300 px at the *fastest* candidate speed.
-            # This keeps the window short regardless of what vx_min is.
-            total_duration = float(t[-1] - t[0])
-            window_s = min(300.0 / max(vx_max, 1.0), total_duration)
-            t_mid = (float(t[0]) + float(t[-1])) / 2.0
-            mask  = (t >= t_mid - window_s / 2) & (t <= t_mid + window_s / 2)
+            best_vx, candidates, variances = scan_vx(
+                t, x, y, vx_min, vx_max, n_steps,
+                status_cb=self._status,
+            )
+            del t, x, y
 
-            if mask.sum() == 0:
-                # Window too narrow or events not centred — use the full recording
-                t_w = t.astype(np.float64)
-                x_w = x.astype(np.float64)
-                y_w = y.astype(np.float64)
-                window_s = total_duration
-            else:
-                t_w = t[mask].astype(np.float64)
-                x_w = x[mask].astype(np.float64)
-                y_w = y[mask].astype(np.float64)
-            del t, x, y  # free full-recording arrays immediately
-
-            # Subsample to at most MAX_EVENTS so each histogram step is fast.
-            MAX_EVENTS = 100_000
-            if len(t_w) > MAX_EVENTS:
-                rng = np.random.default_rng(0)
-                idx = np.sort(rng.choice(len(t_w), MAX_EVENTS, replace=False))
-                t_w, x_w, y_w = t_w[idx], x_w[idx], y_w[idx]
-
-            n_events_used = len(t_w)
-            t_ref  = float(t_w[-1])
-            x_lo, x_hi = float(x_w.min()), float(x_w.max())
-            y_lo, y_hi = float(y_w.min()), float(y_w.max())
-            x_bins = max(int(x_hi - x_lo), 1)
-            y_bins = max(int(y_hi - y_lo), 1)
-
-            candidates = np.linspace(vx_min, vx_max, n_steps)
-            variances  = np.empty(n_steps)
-
-            for i, vx_c in enumerate(candidates):
-                x_warped = x_w - (t_w - t_ref) * vx_c
-                iwe, _, _ = np.histogram2d(
-                    x_warped, y_w,
-                    bins=[x_bins, y_bins],
-                    range=[[x_lo, x_hi], [y_lo, y_hi]],
-                )
-                variances[i] = np.var(iwe)
-                if i % 20 == 0:
-                    self._status(f"Scanning… {i}/{n_steps}  ({100*i//n_steps}%)")
-
-            best_vx = float(candidates[np.argmax(variances)])
             self.vx_var.set(f"{best_vx:.4f}")
             self._status(
                 f"Scan complete.  Best vx = {best_vx:.4f} px/s  "
-                f"(window = {window_s*1000:.0f} ms,  {n_events_used:,} events used)"
+                f"({n_events_total:,} events total)"
             )
 
             fig, ax = plt.subplots(figsize=(8, 4))

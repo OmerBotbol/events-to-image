@@ -1,68 +1,68 @@
 import numpy as np
-from scipy.optimize import minimize_scalar
 
 
-def estimate_vx(t, x, y, vx_initial, min_pixel_travel=50, search_range=0.5):
+def scan_vx(t, x, y, vx_min: float, vx_max: float, n_steps: int = 300,
+            status_cb=None) -> tuple:
     """
-    Estimate horizontal velocity (vx) using a short time window of events.
+    Scan candidate velocities; return (best_vx, candidates, variances).
 
-    Assumes constant speed, so a small window is representative of the full recording.
-    Uses a 1D bounded search — much faster than the 2D Nelder-Mead approach.
+    Selects a short time window centred in the recording so that a moving
+    object spans ~300 px at vx_max.  Subsamples to 100 k events for speed.
+    Uses IWE variance (contrast maximisation) as the focus metric.
 
-    The window duration is derived from vx_initial so that the object always travels
-    at least min_pixel_travel pixels within the window. This ensures the variance
-    landscape has a measurable peak regardless of how fast or slow the object moves.
+    Parameters
+    ----------
+    t, x, y   : event arrays (timestamp, x-coord, y-coord)
+    vx_min/max: scan range in px/s
+    n_steps   : number of candidate velocities
+    status_cb : optional callable(str) for progress messages
 
-    The histogram is built over the active pixel region of the window events rather
-    than the full camera frame, so far/small objects produce an equally sharp
-    variance landscape as close/large ones.
-
-    Args:
-        t:                 Timestamps in seconds (full recording).
-        x:                 X pixel coordinates (full recording).
-        y:                 Y pixel coordinates (full recording).
-        vx_initial:        Initial velocity estimate in pixels/s.
-        min_pixel_travel:  Minimum pixels the object must travel within the window (default 50).
-        search_range:      Fractional search range around vx_initial, e.g. 0.5 = ±50%.
-
-    Returns:
-        vx_optimal: Refined horizontal velocity in pixels/s.
+    Returns
+    -------
+    best_vx   : float
+    candidates: np.ndarray  shape (n_steps,)
+    variances : np.ndarray  shape (n_steps,)
     """
-    window_s = min_pixel_travel / abs(vx_initial)
-    window_s = min(window_s, t[-1] - t[0])
+    total_duration = float(t[-1] - t[0])
+    window_s = min(300.0 / max(vx_max, 1.0), total_duration)
+    t_mid = (float(t[0]) + float(t[-1])) / 2.0
+    mask  = (t >= t_mid - window_s / 2) & (t <= t_mid + window_s / 2)
 
-    t_mid = (t[0] + t[-1]) / 2.0
-    half  = window_s / 2.0
-    mask  = (t >= t_mid - half) & (t <= t_mid + half)
+    if mask.sum() == 0:
+        t_w = t.astype(np.float64)
+        x_w = x.astype(np.float64)
+        y_w = y.astype(np.float64)
+        window_s = total_duration
+    else:
+        t_w = t[mask].astype(np.float64)
+        x_w = x[mask].astype(np.float64)
+        y_w = y[mask].astype(np.float64)
 
-    t_win = t[mask]
-    x_win = x[mask]
-    y_win = y[mask].astype(np.float64)
+    MAX_EVENTS = 100_000
+    if len(t_w) > MAX_EVENTS:
+        rng = np.random.default_rng(0)
+        idx = np.sort(rng.choice(len(t_w), MAX_EVENTS, replace=False))
+        t_w, x_w, y_w = t_w[idx], x_w[idx], y_w[idx]
 
-    if len(t_win) == 0:
-        raise ValueError(
-            f"No events found in {window_s*1000:.0f} ms window around t={t_mid:.3f} s"
-        )
-
-    t_ref = t_win[-1]
-
-    # Histogram over the active pixel region so far/small objects are not penalised
-    # by a mostly-empty full-frame histogram.
-    x_lo, x_hi = float(x_win.min()), float(x_win.max())
-    y_lo, y_hi = float(y_win.min()), float(y_win.max())
+    t_ref  = float(t_w[-1])
+    x_lo, x_hi = float(x_w.min()), float(x_w.max())
+    y_lo, y_hi = float(y_w.min()), float(y_w.max())
     x_bins = max(int(x_hi - x_lo), 1)
     y_bins = max(int(y_hi - y_lo), 1)
 
-    def neg_variance(vx):
-        x_warped = x_win - (t_win - t_ref) * vx
+    candidates = np.linspace(vx_min, vx_max, n_steps)
+    variances  = np.empty(n_steps)
+
+    for i, vx_c in enumerate(candidates):
+        x_warped = x_w - (t_w - t_ref) * vx_c
         iwe, _, _ = np.histogram2d(
-            x_warped, y_win,
+            x_warped, y_w,
             bins=[x_bins, y_bins],
             range=[[x_lo, x_hi], [y_lo, y_hi]],
         )
-        return -np.var(iwe)
+        variances[i] = np.var(iwe)
+        if status_cb is not None and i % 20 == 0:
+            status_cb(f"Scanning… {i}/{n_steps}  ({100 * i // n_steps}%)")
 
-    vx_lo = vx_initial * (1 - search_range)
-    vx_hi = vx_initial * (1 + search_range)
-    result = minimize_scalar(neg_variance, bounds=(vx_lo, vx_hi), method="bounded")
-    return float(result.x)
+    best_vx = float(candidates[np.argmax(variances)])
+    return best_vx, candidates, variances

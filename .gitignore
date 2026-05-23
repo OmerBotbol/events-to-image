@@ -11,3 +11,6 @@ events/*
 venv/
 
 utils/cnvt_raw_2_csv/
+
+# Model weights — too large for GitHub (download separately)
+models/*.pth
