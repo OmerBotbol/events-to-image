@@ -34,6 +34,50 @@ def load_events(hdf5_path: Path):
     return t, x, y, pol
 
 
+def _h5_bisect(ts_ds, target: float, lo: int, hi: int) -> int:
+    """Binary search on an HDF5 timestamp dataset — O(log N) element reads."""
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if float(ts_ds[mid]) < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _load_events_for_scan(h5_path: Path, vx_max: float) -> tuple:
+    """
+    Load only the events inside the time window that scan_vx will use
+    (min(300/vx_max, total_duration) seconds centred in the recording).
+
+    Uses binary search on HDF5 timestamps to find the slice boundaries
+    without reading the full timestamp array.  Peak RAM scales with the
+    window size, not the recording length.
+    """
+    with h5py.File(h5_path, "r") as f:
+        evs = f["events"]
+        n   = len(evs["timestamp"])
+
+        t_first = float(evs["timestamp"][0])
+        t_last  = float(evs["timestamp"][n - 1])
+        total_duration = max(t_last - t_first, 1e-9)
+
+        window_s = min(300.0 / max(float(vx_max), 1.0), total_duration)
+        t_mid    = (t_first + t_last) / 2.0
+        t_lo     = t_mid - window_s / 2.0
+        t_hi     = t_mid + window_s / 2.0
+
+        i_lo = _h5_bisect(evs["timestamp"], t_lo, 0, n)
+        i_hi = _h5_bisect(evs["timestamp"], t_hi, i_lo, n)
+
+        t   = evs["timestamp"][i_lo:i_hi].astype(np.float64)
+        x   = evs["x"][i_lo:i_hi].astype(np.float64)
+        y   = evs["y"][i_lo:i_hi].astype(np.float64)
+        pol = evs["polarity"][i_lo:i_hi].astype(np.float32)
+    return t, x, y, pol
+
+
+
 def run_twe(t, x, y, polarity, vx: float, subpixel_scale: int,
             hp_window: int, norm_div: float,
             save_path=None, status_cb=None):
@@ -337,8 +381,8 @@ class TWEApp(tk.Tk):
         self._status("Loading events for velocity scan…")
         self.progress.start()
         try:
-            t, x, y, _ = load_events(h5)
-            n_events_total = len(t)
+            t, x, y, _ = _load_events_for_scan(h5, vx_max)
+            n_loaded = len(t)
 
             best_vx, candidates, variances = scan_vx(
                 t, x, y, vx_min, vx_max, n_steps,
@@ -349,7 +393,7 @@ class TWEApp(tk.Tk):
             self.vx_var.set(f"{best_vx:.4f}")
             self._status(
                 f"Scan complete.  Best vx = {best_vx:.4f} px/s  "
-                f"({n_events_total:,} events total)"
+                f"({n_loaded:,} events loaded)"
             )
 
             fig, ax = plt.subplots(figsize=(8, 4))

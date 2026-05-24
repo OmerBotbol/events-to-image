@@ -15,78 +15,111 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
+import h5py
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
-from tiwe import load_events
+from tiwe import _load_events_for_scan
 from utils.flow import scan_vx
 
 
-# ── core IWE computation ──────────────────────────────────────────────────────
+# ── core IWE computation — streams from HDF5, never loads all events ──────────
 
-def compute_iwe(t, x, y, polarity,
-                vx: float, vy: float,
+def compute_iwe(h5_path, vx: float, vy: float,
                 height: int, width: int,
+                pol_mode: str = "signed",
                 chunk_size: int = 500_000,
-                status_cb=None) -> np.ndarray:
+                status_cb=None):
     """
-    Warp events to the last timestamp using (vx, vy) and accumulate via
-    bilinear splatting.  Processes events in chunks to bound peak RAM.
+    Stream events from HDF5 in chunks and accumulate via bilinear splatting.
+    Peak RAM is O(chunk_size) — safe even for recordings with hundreds of
+    millions of events.
 
     Parameters
     ----------
-    t, x, y, polarity : event arrays
-    vx, vy            : optical flow components in px/s
-    height, width     : output image dimensions
-    chunk_size        : events processed per iteration (tune to available RAM)
-    status_cb         : optional callable(str) for progress messages
+    h5_path    : path to events.h5
+    vx, vy     : optical flow in px/s
+    height, width : output image dimensions
+    pol_mode   : "signed" | "unsigned" | "split"
+    chunk_size : events read per HDF5 slice
+    status_cb  : optional callable(str) for progress messages
 
     Returns
     -------
-    iwe : float32 array of shape (height, width)
+    "signed"/"unsigned" → iwe          (H×W float32)
+    "split"             → (iwe_pos, iwe_neg, iwe_combined), each H×W float32
     """
-    t_ref    = float(t[-1])
     N        = height * width
     iwe_flat = np.zeros(N, dtype=np.float32)
-    n_events = len(t)
+    neg_flat = np.zeros(N, dtype=np.float32) if pol_mode == "split" else None
 
-    for start in range(0, n_events, chunk_size):
-        end = min(start + chunk_size, n_events)
+    with h5py.File(h5_path, "r") as f:
+        evs      = f["events"]
+        n_events = len(evs["timestamp"])
+        t_ref    = float(evs["timestamp"][n_events - 1])   # one scalar read
 
-        if status_cb is not None and (start // chunk_size) % 5 == 0:
-            pct = 100 * start // n_events
-            status_cb(f"Computing IWE… {start:,}/{n_events:,}  ({pct}%)")
+        for start in range(0, n_events, chunk_size):
+            end = min(start + chunk_size, n_events)
 
-        dt  = (t_ref - t[start:end]).astype(np.float32)
-        x_w = x[start:end].astype(np.float32) + vx * dt
-        y_w = y[start:end].astype(np.float32) + vy * dt
-        pol = polarity[start:end]
-        del dt
+            if status_cb and (start // chunk_size) % 5 == 0:
+                pct = 100 * start // n_events
+                status_cb(f"Computing IWE… {start:,}/{n_events:,}  ({pct}%)")
 
-        x0 = np.floor(x_w).astype(np.int32)
-        y0 = np.floor(y_w).astype(np.int32)
-        wx = (x_w - x0).astype(np.float32)
-        wy = (y_w - y0).astype(np.float32)
-        del x_w, y_w
+            t_c = evs["timestamp"][start:end].astype(np.float32)
+            x_c = evs["x"][start:end].astype(np.float32)
+            y_c = evs["y"][start:end].astype(np.float32)
+            p_c = evs["polarity"][start:end].astype(np.float32)
 
-        for xi, yi, wi in [
-            (x0,     y0,     (1.0 - wx) * (1.0 - wy)),
-            (x0 + 1, y0,     wx         * (1.0 - wy)),
-            (x0,     y0 + 1, (1.0 - wx) * wy        ),
-            (x0 + 1, y0 + 1, wx         * wy        ),
-        ]:
-            mask = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
-            idx  = yi[mask] * width + xi[mask]
-            iwe_flat += np.bincount(
-                idx,
-                weights=(wi * pol)[mask],
-                minlength=N,
-            ).astype(np.float32)
+            dt  = np.float32(t_ref) - t_c;           del t_c
+            x_w = x_c + np.float32(vx) * dt;         del x_c
+            y_w = y_c + np.float32(vy) * dt;         del y_c, dt
 
+            x0 = np.floor(x_w).astype(np.int32)
+            y0 = np.floor(y_w).astype(np.int32)
+            wx = (x_w - x0).astype(np.float32)
+            wy = (y_w - y0).astype(np.float32)
+            del x_w, y_w
+
+            for xi, yi, wi in [
+                (x0,     y0,     (1.0 - wx) * (1.0 - wy)),
+                (x0 + 1, y0,     wx         * (1.0 - wy)),
+                (x0,     y0 + 1, (1.0 - wx) * wy        ),
+                (x0 + 1, y0 + 1, wx         * wy        ),
+            ]:
+                in_b = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+                if not in_b.any():
+                    continue
+                idx = (yi[in_b] * width + xi[in_b]).astype(np.int32)
+                w   = (wi * p_c)[in_b]
+
+                if pol_mode == "unsigned":
+                    w = np.abs(w)
+
+                if pol_mode == "split":
+                    pos = w > 0
+                    neg = w < 0
+                    if pos.any():
+                        iwe_flat += np.bincount(
+                            idx[pos], weights=w[pos], minlength=N
+                        ).astype(np.float32)
+                    if neg.any():
+                        neg_flat += np.bincount(
+                            idx[neg], weights=-w[neg], minlength=N
+                        ).astype(np.float32)
+                else:
+                    iwe_flat += np.bincount(
+                        idx, weights=w, minlength=N
+                    ).astype(np.float32)
+
+    if pol_mode == "split":
+        iwe_pos = iwe_flat.reshape(height, width)
+        iwe_neg = neg_flat.reshape(height, width)
+        return iwe_pos, iwe_neg, iwe_pos - iwe_neg
     return iwe_flat.reshape(height, width)
+
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -161,8 +194,6 @@ class IWEApp(tk.Tk):
         tk.Entry(size_frame, textvariable=self.width_var,  width=6).pack(side="left", padx=4)
         tk.Label(size_frame, text="×").pack(side="left")
         tk.Entry(size_frame, textvariable=self.height_var, width=6).pack(side="left", padx=4)
-        tk.Label(size_frame, text="(auto-detected from events if left unchanged)",
-                 foreground="gray").pack(side="left", padx=6)
 
         # ── polarity mode ──
         tk.Label(self, text="Polarity mode:").grid(row=8, column=0, sticky="w", **P)
@@ -231,8 +262,8 @@ class IWEApp(tk.Tk):
         self._status("Loading events for velocity scan…")
         self.progress.start()
         try:
-            t, x, y, _ = load_events(h5)
-            n_total = len(t)
+            t, x, y, _ = _load_events_for_scan(h5, vx_max)
+            n_loaded = len(t)
 
             best_vx, candidates, variances = scan_vx(
                 t, x, y, vx_min, vx_max, n_steps,
@@ -243,7 +274,7 @@ class IWEApp(tk.Tk):
             self.vx_var.set(f"{best_vx:.4f}")
             self._status(
                 f"Scan complete.  Best vx = {best_vx:.4f} px/s  "
-                f"({n_total:,} events total)"
+                f"({n_loaded:,} events loaded)"
             )
 
             fig, ax = plt.subplots(figsize=(8, 4))
@@ -286,55 +317,39 @@ class IWEApp(tk.Tk):
             messagebox.showerror("Invalid parameter", "Check vx / vy values.")
             return
 
+        try:
+            width  = int(self.width_var.get())
+            height = int(self.height_var.get())
+            if width < 1 or height < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid camera size",
+                                 "Enter valid width and height (e.g. 1280 × 720).")
+            return
+
+        pol_mode = self.pol_mode_var.get()
+
         self.progress.start()
         try:
-            # ── 1. Load events ───────────────────────────────────────────────
-            self._status("Loading events from HDF5…")
-            t, x, y, polarity = load_events(h5_path)
+            self._status(f"Computing IWE  (vx={vx:.4f}, vy={vy:.4f})  "
+                         f"streaming from HDF5…")
 
-            # ── 2. Resolve image dimensions ──────────────────────────────────
-            try:
-                width  = int(self.width_var.get())
-                height = int(self.height_var.get())
-                if width < 1 or height < 1:
-                    raise ValueError
-            except ValueError:
-                width  = int(x.max()) + 1
-                height = int(y.max()) + 1
-                self.width_var.set(str(width))
-                self.height_var.set(str(height))
+            result = compute_iwe(
+                h5_path, vx, vy, height, width,
+                pol_mode=pol_mode,
+                status_cb=self._status,
+            )
 
-            # Auto-expand if events exceed declared size
-            width  = max(width,  int(x.max()) + 1)
-            height = max(height, int(y.max()) + 1)
-
-            # ── 3. Polarity mode ─────────────────────────────────────────────
-            pol_mode = self.pol_mode_var.get()
-            if pol_mode == "unsigned":
-                polarity = np.ones_like(polarity)
-
-            # ── 4. Compute IWE ───────────────────────────────────────────────
-            self._status(f"Computing IWE  (vx={vx:.4f}, vy={vy:.4f}) …")
-
-            if pol_mode == "split":
-                mask_pos = polarity > 0
-                mask_neg = polarity < 0
-                iwe_pos = compute_iwe(t[mask_pos], x[mask_pos], y[mask_pos],
-                                      polarity[mask_pos], vx, vy, height, width,
-                                      status_cb=self._status)
-                iwe_neg = compute_iwe(t[mask_neg], x[mask_neg], y[mask_neg],
-                                      polarity[mask_neg], vx, vy, height, width,
-                                      status_cb=self._status)
-                iwe = iwe_pos - iwe_neg
-            else:
-                iwe = compute_iwe(t, x, y, polarity, vx, vy, height, width,
-                                  status_cb=self._status)
-
-            # ── 5. Save ──────────────────────────────────────────────────────
+            # ── Save ────────────────────────────────────────────────────────
             npy_path = events_path / "iwe_reconstructed.npy"
-            np.save(npy_path, iwe)
+            if pol_mode == "split":
+                iwe_pos, iwe_neg, iwe = result
+                np.save(npy_path, iwe)
+            else:
+                iwe = result
+                np.save(npy_path, iwe)
 
-            # ── 6. Display ───────────────────────────────────────────────────
+            # ── Display ──────────────────────────────────────────────────────
             self._status(f"Done.  IWE shape: {iwe.shape[1]} × {iwe.shape[0]} px")
 
             if pol_mode == "split":
